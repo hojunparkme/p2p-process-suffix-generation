@@ -11,7 +11,11 @@ Department of Industrial and Information Systems Engineering, Soongsil Universit
 
 ## Overview
 
-A zero-shot framework for activity suffix generation in Purchase-to-Pay (P2P) business processes. Unlike supervised approaches that rely solely on prefix sequences, our method accepts a **natural language query** describing the current business situation alongside **transition probability-based candidates**, enabling an LLM to generate contextually appropriate activity suffixes without training or annotation.
+Supervised approaches to predictive process monitoring are structurally limited to the prefix sequence — they predict the most statistically likely continuation from historical patterns, with no mechanism to account for the actual business context of a running case. Two cases with identical prefix sequences may require entirely different resolution paths depending on the underlying business problem, yet a supervised model receiving identical inputs produces identical predictions.
+
+**Key insight:** Process participants already possess contextual knowledge about their current situation. Our framework captures this knowledge through a natural language query and combines it with transition probability-based candidate filtering to guide an LLM in generating the complete activity suffix — without any model training or expert annotation.
+
+Evaluated on the BPI Challenge 2019 dataset (251,734 cases, 42 activities), our method outperforms supervised baselines including Tax LSTM and SuTraN across all six event categories on both Damerau-Levenshtein similarity and F1.
 
 ---
 
