@@ -85,6 +85,12 @@ SuTraN evaluation (requires [official repo](https://github.com/BrechtWts/SuffixT
 ---
 
 ## Related Work
-- [SuTraN](https://github.com/BrechtWts/SuffixTransformerNetwork) - Wuyts et al., ICPM 2024
-- [LUPIN](https://github.com/vinspdb/LUPIN) - Pasquadibisceglie et al., ICPM 2024
-- [BPI Challenge 2019](https://doi.org/10.4121/uuid:d06aff4b-79f0-45e6-8ec8-e19730c248f1)
+- Tax et al. (2017) - Predictive Business Process Monitoring with LSTM Neural Networks, CAiSE
+- Wuyts et al. (2024) - SuTraN: Encoder-Decoder Transformer for Suffix Prediction, ICPM
+- Bukhsh et al. (2021) - ProcessTransformer: Predictive Business Process Monitoring with Transformer
+- Rama-Maneiro et al. (2021) - Deep Learning for Predictive Business Process Monitoring: Review and Benchmark, IEEE TSC
+- Pasquadibisceglie et al. (2024) - LUPIN: LLM Approach for Activity Suffix Prediction, ICPM
+- Oved et al. (2025) - SNAP: Semantic Stories for Next Activity Prediction, AAAI
+- Casciani et al. (2026) - Enhancing Next Activity Prediction with RAG, Information Systems
+- Park et al. (in press) - Structure-Preserving Process Case Embeddings via Directed Graph Convolutional Networks, ICIC Express Letters
+- van Dongen (2019) - BPI Challenge 2019 Dataset, 4TU
