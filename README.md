@@ -1,7 +1,6 @@
 # Zero-Shot Process Suffix Generation via Transition Probability-Guided LLM Reasoning
 
-**Author:** Ho Jun Park, Younsoo Lee, Changmuk Kang
-Department of Industrial and Information Systems Engineering, Soongsil University
+**Ho Jun Park** | Industrial and Information Systems Engineering, Soongsil University
 
 ---
 
