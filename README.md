@@ -92,5 +92,5 @@ SuTraN evaluation (requires [official repo](https://github.com/BrechtWts/SuffixT
 - Pasquadibisceglie et al. (2024) - LUPIN: LLM Approach for Activity Suffix Prediction, ICPM
 - Oved et al. (2025) - SNAP: Semantic Stories for Next Activity Prediction, AAAI
 - Casciani et al. (2026) - Enhancing Next Activity Prediction with RAG, Information Systems
-- Park et al. (in press) - Structure-Preserving Process Case Embeddings via Directed Graph Convolutional Networks, ICIC Express Letters
+- Park et al. (in press) - Structure-Preserving Process Case Embeddings via Directed Graph Convolutional Networks, ICICIC 2025
 - van Dongen (2019) - BPI Challenge 2019 Dataset, 4TU
