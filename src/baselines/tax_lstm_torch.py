@@ -1,28 +1,63 @@
 """
-Tax et al. (2017) LSTM Baseline - BPI 2019 (PyTorch 버전)
-- GPU 자동 사용
-- maxlen: 98.5th percentile
-- 배치 generator로 메모리 효율적 학습
-- QA 180개 평가: DL similarity + F1
+Tax et al. (2017) LSTM baseline for activity suffix prediction on BPI Challenge 2019.
+
+This module reproduces the LSTM baseline from:
+    Tax, N., Verenich, I., La Rosa, M., & Dumas, M. (2017).
+    Predictive Business Process Monitoring with LSTM Neural Networks. CAiSE 2017.
+
+The original architecture has a shared LSTM encoder that branches into two
+single-LSTM heads — one for next-activity classification and one for
+next-event time-delta regression. Suffix prediction is performed by iterative
+single-step forward passes until the EOS token ('!') is produced or
+`max_steps` is reached.
+
+Adaptation for the CTP-LLM evaluation:
+  - Activity vocabulary is filtered to 25 human-initiated P2P activities
+    (excluding the 17 SRM/system-initiated activities of the original log).
+  - The model is trained on 2/3 of the cases, validated on the next 1/6, and
+    held out from the final 1/6 used for the QA evaluation.
+  - Evaluation iterates over the 180 QA instances; for each, the prefix is
+    fed in (timestamps reconstructed from the source log when available, or
+    synthesized as 1-hour intervals from a fixed base date), suffix is
+    predicted, and DL-similarity + F1 are computed against the ground truth.
+
+Inputs (configurable via CLI):
+  - BPI_Challenge_2019.xes  : event log (XES)
+  - qa_dataset_final.pkl    : 180 evaluation QA instances
+
+Outputs:
+  - tax_lstm_output/models/best_model.pt : best validation-loss checkpoint
+  - tax_lstm_output/meta.pkl             : vocab + normalization stats
+  - tax_lstm_output/tax_lstm_results.pkl : per-QA predictions and summary
 """
 
-import os, sys, pickle, argparse
-import numpy as np
+import argparse
+import os
+import pickle
+import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timedelta
-import xml.etree.ElementTree as ET
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 XES_PATH   = "/workspace/hojun/BPI_Challenge_2019.xes"
 QA_PATH    = "/workspace/hojun/qa_dataset_final.pkl"
 OUTPUT_DIR = "/workspace/hojun/tax_lstm_output"
-EOS        = '!'
+EOS        = '!'  # End-of-sequence token appended to every training case
 
+# Human-initiated P2P activity vocabulary (25 labels). SRM/system-initiated
+# activities from the BPIC 2019 log are excluded so the model's decision space
+# matches the set of actions a process participant would actually choose.
 VALID_ACTS = {
     'Block Purchase Order Item', 'Cancel Goods Receipt', 'Cancel Invoice Receipt',
     'Cancel Subsequent Invoice', 'Change Approval for Purchase Order',
@@ -36,10 +71,25 @@ VALID_ACTS = {
     'Update Order Confirmation', 'Vendor creates debit memo', 'Vendor creates invoice',
 }
 
-# ─────────────────────────────────────────────
-# 1. XES 파싱
-# ─────────────────────────────────────────────
+
+# ============================================================
+# 1. XES parsing
+# ============================================================
+
 def parse_xes(path, valid_acts=None, max_cases=None):
+    """Stream-parse a XES log and return cases as {case_id: [(activity, timestamp), ...]}.
+
+    Uses iterparse with element clearing so memory stays bounded even on
+    large logs. Cases with fewer than 2 events are dropped.
+
+    Args:
+        path: Path to the .xes file.
+        valid_acts: If provided, only events with concept:name in this set are kept.
+        max_cases: Optional limit on number of traces to process (for testing).
+
+    Returns:
+        Dict mapping case_id (str) to a list of (activity_name, datetime) tuples.
+    """
     print(f"XES 파싱 중: {path}")
     cases = {}
     in_trace = in_event = False
@@ -98,10 +148,19 @@ def parse_xes(path, valid_acts=None, max_cases=None):
     return cases
 
 
-# ─────────────────────────────────────────────
-# 2. Vocab
-# ─────────────────────────────────────────────
+# ============================================================
+# 2. Vocabulary
+# ============================================================
+
 def build_vocab(cases):
+    """Build input/target vocabularies from observed activities.
+
+    Returns:
+        (char_idx, tgt_idx, tgt_idx_char) where:
+          - char_idx maps activity → index for input one-hot encoding,
+          - tgt_idx maps target token (activity or EOS) → index,
+          - tgt_idx_char inverts tgt_idx.
+    """
     all_acts = sorted({a for evts in cases.values() for a, _ in evts})
     char_idx     = {c: i for i, c in enumerate(all_acts)}
     target_chars = all_acts + [EOS]
@@ -111,10 +170,24 @@ def build_vocab(cases):
     return char_idx, tgt_idx, tgt_idx_char
 
 
-# ─────────────────────────────────────────────
-# 3. 통계 & maxlen
-# ─────────────────────────────────────────────
+# ============================================================
+# 3. Statistics & maxlen
+# ============================================================
+
 def compute_stats(cases, train_ids, percentile=98.5):
+    """Compute the prefix length cap and time-delta normalization divisors.
+
+    Args:
+        cases: Dict of all parsed cases.
+        train_ids: Subset of case_ids used for fitting these statistics.
+        percentile: Length percentile to use as the maxlen cap (default 98.5).
+
+    Returns:
+        Tuple (maxlen, divisor, divisor2) where:
+          - maxlen: prefix-length cap based on the chosen percentile,
+          - divisor: mean of consecutive event time deltas (seconds),
+          - divisor2: mean of elapsed-since-case-start time deltas (seconds).
+    """
     lengths, diffs, diffs2 = [], [], []
     for cid in train_ids:
         evts = cases[cid]
@@ -133,17 +206,31 @@ def compute_stats(cases, train_ids, percentile=98.5):
     return maxlen, divisor, divisor2
 
 
-# ─────────────────────────────────────────────
+# ============================================================
 # 4. Dataset
-# ─────────────────────────────────────────────
+# ============================================================
+
 def case_to_tensor(evts, maxlen, char_idx, tgt_idx, divisor, divisor2):
-    """케이스 → (X, y_act, y_time) 텐서 리스트"""
+    """Convert one case into a list of (X, y_act, y_time) training tuples.
+
+    For a case of length n, n training prefixes are emitted: [a_1], [a_1, a_2], ...,
+    [a_1, ..., a_n]; targets are the next activity (or EOS for the last) and the
+    next time delta. Each prefix is left-padded to maxlen.
+
+    Feature layout per timestep (length = num_feats = n_input + 5):
+      [0 : n_input]  one-hot activity
+      [n_input + 0]  position index (1-based)
+      [n_input + 1]  time since previous event / divisor
+      [n_input + 2]  time since case start / divisor2
+      [n_input + 3]  time since midnight / 86400
+      [n_input + 4]  weekday / 7
+    """
     acts    = [a for a, _ in evts] + [EOS]
     ts_list = [t for _, t in evts]
     n_input   = len(char_idx)
     num_feats = n_input + 5
-    n_target  = len(tgt_idx)
 
+    # Precompute time features for each event in the case
     t_prev, t_start, t_day, t_week = [], [], [], []
     case_start = ts_list[0]
     last_t = ts_list[0]
@@ -157,7 +244,7 @@ def case_to_tensor(evts, maxlen, char_idx, tgt_idx, divisor, divisor2):
 
     results = []
     for i in range(1, len(acts)):
-        sent = acts[max(0, i-maxlen):i]   # truncate
+        sent = acts[max(0, i-maxlen):i]   # truncate to maxlen
         L    = len(sent)
         leftpad = maxlen - L
 
@@ -178,6 +265,7 @@ def case_to_tensor(evts, maxlen, char_idx, tgt_idx, divisor, divisor2):
 
         nc = acts[i]
         ya = tgt_idx.get(nc, 0)
+        # Time target is 0 when the next token is EOS or out of range
         yt = (t_prev[i] / (divisor + 1e-9)) if (nc != EOS and i < len(t_prev)) else 0.0
 
         results.append((x, ya, np.float32(yt)))
@@ -185,6 +273,13 @@ def case_to_tensor(evts, maxlen, char_idx, tgt_idx, divisor, divisor2):
 
 
 class BPI19Dataset(Dataset):
+    """PyTorch Dataset that materializes all (prefix → next-token) pairs in memory.
+
+    For BPIC 2019 with ~250k cases, this produces on the order of 1-2M training
+    samples. Memory usage is acceptable on standard ML workstations; if scaling
+    further, switch to lazy iteration over cases.
+    """
+
     def __init__(self, cases, case_ids, maxlen, char_idx, tgt_idx, divisor, divisor2):
         self.data = []
         print(f"  Dataset 구축 중 ({len(case_ids):,}개 케이스)...")
@@ -208,14 +303,25 @@ class BPI19Dataset(Dataset):
         )
 
 
-# ─────────────────────────────────────────────
-# 5. 모델
-# ─────────────────────────────────────────────
+# ============================================================
+# 5. Model
+# ============================================================
+
 class TaxLSTM(nn.Module):
+    """Tax et al. (2017) two-headed LSTM.
+
+    Architecture:
+        x → LSTM_shared → LSTM_act → BatchNorm → FC → activity logits
+                       → LSTM_time → BatchNorm → FC → time prediction
+
+    Only the final timestep's hidden state is used at each branch (the
+    BatchNorm is applied to the last-step vector before the head). This is
+    the standard design from the original paper.
+    """
+
     def __init__(self, num_feats, n_target, hidden=100, dropout=0.2):
         super().__init__()
         self.lstm_shared = nn.LSTM(num_feats, hidden, batch_first=True, dropout=dropout)
-        self.bn_shared   = nn.BatchNorm1d(hidden)
         self.lstm_act    = nn.LSTM(hidden, hidden, batch_first=True, dropout=dropout)
         self.bn_act      = nn.BatchNorm1d(hidden)
         self.lstm_time   = nn.LSTM(hidden, hidden, batch_first=True, dropout=dropout)
@@ -226,7 +332,6 @@ class TaxLSTM(nn.Module):
     def forward(self, x):
         # x: (B, T, F)
         out, _ = self.lstm_shared(x)                     # (B, T, H)
-        out_bn = self.bn_shared(out[:, -1, :])           # (B, H)
 
         out_a, _ = self.lstm_act(out)
         out_a_bn = self.bn_act(out_a[:, -1, :])
@@ -239,11 +344,21 @@ class TaxLSTM(nn.Module):
         return act_logits, time_pred
 
 
-# ─────────────────────────────────────────────
-# 6. 학습
-# ─────────────────────────────────────────────
+# ============================================================
+# 6. Training
+# ============================================================
+
 def train_model(cases, train_ids, val_ids, meta, model_dir,
                 batch_size=512, epochs=500, patience=42):
+    """Train TaxLSTM with early stopping on validation loss.
+
+    Loss is the sum of cross-entropy (activity) and L1 (time). The model
+    checkpoint with the lowest validation loss is saved to
+    `{model_dir}/best_model.pt`.
+
+    Returns:
+        Path to the best-checkpoint file.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n디바이스: {device}")
 
@@ -321,10 +436,29 @@ def train_model(cases, train_ids, val_ids, meta, model_dir,
     return best_path
 
 
-# ─────────────────────────────────────────────
-# 7. Suffix Prediction
-# ─────────────────────────────────────────────
+# ============================================================
+# 7. Suffix prediction
+# ============================================================
+
 def predict_suffix(model, prefix_events, meta, device, max_steps=25):
+    """Generate the activity suffix by iterative single-step decoding.
+
+    At each step the current sequence is encoded into the same feature
+    layout used at training time (left-padded to maxlen), the model emits an
+    activity logit and a time-delta prediction; the argmax activity is
+    appended (with the predicted time delta to advance the timestamp), and
+    the loop terminates on EOS or after `max_steps`.
+
+    Args:
+        model: Trained TaxLSTM in eval mode.
+        prefix_events: List of (activity_name, datetime) for the case prefix.
+        meta: Vocab + normalization stats from training.
+        device: torch device.
+        max_steps: Hard cap on suffix length to prevent runaway generation.
+
+    Returns:
+        List of predicted activity names (without EOS).
+    """
     maxlen       = meta['maxlen']
     num_feats    = meta['num_feats']
     n_input      = meta['n_input']
@@ -368,16 +502,23 @@ def predict_suffix(model, prefix_events, meta, device, max_steps=25):
                 break
 
             predicted.append(next_act)
+            # Advance the timestamp by the predicted time delta (denormalized)
             dt = max(0.0, float(time_pred[0].item()) * (divisor + 1e-9))
             current.append((next_act, current[-1][1] + timedelta(seconds=dt)))
 
     return predicted
 
 
-# ─────────────────────────────────────────────
-# 8. 평가 지표
-# ─────────────────────────────────────────────
+# ============================================================
+# 8. Evaluation metrics
+# ============================================================
+
 def dl_similarity(s1, s2):
+    """Length-normalized Damerau-Levenshtein similarity in [0, 1].
+
+    Counts insertions, deletions, substitutions, and adjacent transpositions.
+    Returns 1 - edit_distance / max(len(s1), len(s2)), clamped to non-negative.
+    """
     if not s1 and not s2: return 1.0
     if not s1 or  not s2: return 0.0
     l1, l2 = len(s1), len(s2)
@@ -391,7 +532,12 @@ def dl_similarity(s1, s2):
                 d[j] = min(d[j], prev[j-1])
     return max(0.0, 1 - d[l2] / max(l1, l2))
 
+
 def f1_sets(pred, answer):
+    """Multiset-overlap F1 between predicted and ground-truth suffixes.
+
+    Treats both sequences as bags of activities, ignoring position and order.
+    """
     pc, ac = Counter(pred), Counter(answer)
     tp = sum((pc & ac).values())
     if tp == 0: return 0.0
@@ -400,10 +546,18 @@ def f1_sets(pred, answer):
     return 2*p*r/(p+r)
 
 
-# ─────────────────────────────────────────────
-# 9. QA 평가
-# ─────────────────────────────────────────────
+# ============================================================
+# 9. QA evaluation
+# ============================================================
+
 def evaluate_on_qa(model, qa_dataset, meta, cases, device):
+    """Run the trained model on the 180 QA instances and aggregate per-event-type stats.
+
+    For each QA instance, the prefix's timestamps are taken from the matching
+    case in the source log when available; if no match is found, synthetic
+    1-hour-spaced timestamps from a fixed base date are used (this affects
+    only the time features, not the activity prediction itself).
+    """
     results = {}
     dl_list, f1_list = [], []
     print("\nQA 평가 시작...")
@@ -412,7 +566,7 @@ def evaluate_on_qa(model, qa_dataset, meta, cases, device):
         given  = list(qa['given'])
         answer = list(qa['answer'])
 
-        # prefix_events 찾기 (타임스탬프 포함)
+        # Locate this prefix in the source cases to recover real timestamps
         prefix_events = None
         for cid, evts in cases.items():
             acts = [a for a, _ in evts]
@@ -423,6 +577,7 @@ def evaluate_on_qa(model, qa_dataset, meta, cases, device):
             if prefix_events:
                 break
 
+        # Fallback to synthetic timestamps if the prefix isn't found in the log
         if prefix_events is None:
             base = datetime(2018, 6, 1, 9, 0, 0,
                             tzinfo=datetime.now().astimezone().tzinfo)
@@ -460,7 +615,7 @@ def evaluate_on_qa(model, qa_dataset, meta, cases, device):
     print(f"  F1 Score      : {summary['mean_f1']:.4f}")
     print(f"{'='*50}")
 
-    # 이벤트 타입별
+    # Per-event-type breakdown
     by_type = {}
     for qa_id, r in results.items():
         key = qa_dataset[qa_id]['event_key']
@@ -475,16 +630,19 @@ def evaluate_on_qa(model, qa_dataset, meta, cases, device):
     return results, summary
 
 
-# ─────────────────────────────────────────────
-# 10. 메인
-# ─────────────────────────────────────────────
+# ============================================================
+# 10. Main
+# ============================================================
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--xes',        default=XES_PATH)
     parser.add_argument('--qa',         default=QA_PATH)
     parser.add_argument('--output',     default=OUTPUT_DIR)
-    parser.add_argument('--skip_train', action='store_true')
-    parser.add_argument('--max_cases',  type=int, default=None)
+    parser.add_argument('--skip_train', action='store_true',
+                        help='Skip training and load best_model.pt directly.')
+    parser.add_argument('--max_cases',  type=int, default=None,
+                        help='Optional cap on parsed cases (for quick smoke tests).')
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--percentile', type=float, default=98.5)
     args = parser.parse_args()
@@ -500,13 +658,13 @@ def main():
     result_path = os.path.join(args.output, 'tax_lstm_results.pkl')
     os.makedirs(model_dir, exist_ok=True)
 
-    # 파싱
+    # Parse log
     cases = parse_xes(args.xes, valid_acts=VALID_ACTS, max_cases=args.max_cases)
 
-    # vocab
+    # Vocabulary
     char_idx, tgt_idx, tgt_idx_char = build_vocab(cases)
 
-    # 분리
+    # 2/3 train / 1/6 val / 1/6 test split by sorted case_id
     case_ids  = sorted(cases.keys())
     n         = len(case_ids)
     train_ids = case_ids[:int(n * 2/3)]
@@ -514,7 +672,7 @@ def main():
     test_ids  = case_ids[int(n * 5/6):]
     print(f"학습: {len(train_ids):,}  val: {len(val_ids):,}  test: {len(test_ids):,}")
 
-    # 통계
+    # Statistics fit on the train split only
     maxlen, divisor, divisor2 = compute_stats(cases, train_ids, args.percentile)
 
     n_input   = len(char_idx)
@@ -539,18 +697,18 @@ def main():
     else:
         print(f"학습 건너뜀: {best_path}")
 
-    # 모델 로드
+    # Load best checkpoint for evaluation
     model = TaxLSTM(num_feats, n_target).to(device)
     model.load_state_dict(torch.load(best_path, map_location=device))
     print("모델 로드 완료")
 
-    # QA 로드
+    # Load QA evaluation set
     with open(args.qa, 'rb') as f:
         qa_raw = pickle.load(f)
     qa_dataset = qa_raw.get('qa_dataset', qa_raw) if isinstance(qa_raw, dict) else qa_raw
     print(f"QA: {len(qa_dataset)}개")
 
-    # 평가
+    # Evaluate
     results, summary = evaluate_on_qa(model, qa_dataset, meta, cases, device)
 
     with open(result_path, 'wb') as f:
