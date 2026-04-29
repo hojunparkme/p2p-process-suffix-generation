@@ -1,36 +1,70 @@
+"""
+CTP-LLM: Context and Transition Probability-guided LLM for P2P process suffix generation.
+
+This module runs the main experiment of the paper. For each of the 180 evaluation QA
+instances drawn from the BPI Challenge 2019 Purchase-to-Pay log, it iteratively
+generates an activity suffix by combining:
+
+  (1) a community-based top-K candidate list derived from precomputed transition
+      probabilities P(b | a, c) for the case's community c, and
+  (2) an LLM (Claude Sonnet 4.6, temperature 0) prompted with the business-context
+      query, the observed prefix, and the candidate list. The LLM selects one
+      candidate per step until <END> is produced or MAX_STEPS is reached.
+
+Outputs per instance: predicted suffix, Damerau-Levenshtein similarity, F1 score,
+edit distance, prefix+suffix combined similarity, and per-step parsing status.
+
+A checkpoint file is written after every instance so the run can resume after
+interruption without losing progress.
+
+Inputs (must be present in working directory):
+  - qa_dataset_final.pkl       : evaluation QA instances
+  - comm{0..5}_probabilities_final.pkl : per-community transition probabilities
+
+Outputs:
+  - claude_results_final2.pkl  : final results dict
+  - checkpoint_claude_final2.pkl : intermediate checkpoint (resume support)
+"""
+
+# Standard library
 import os
+import pickle
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+# Third-party
+from anthropic import Anthropic
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# ============================================================
-# Claude API 프로세스 이벤트 생성 - FINAL
-# 데이터: 180개 (QA 39 제거)
-# 변경사항:
-#   - qa_dataset_v7.pkl 사용 (given에 Clear Invoice 있는 케이스 추가 필터링)
-#   - System prompt: Vendor creates invoice 관련 주석 제거
-#   - 체크포인트 v7로 분리
-# ============================================================
-
-import pickle
-import random
-import re
-from collections import defaultdict
-from pathlib import Path
-from anthropic import Anthropic
 
 # ============================================================
-# 설정
+# Configuration
 # ============================================================
-CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # ← 여기에 API 키 입력
+
+# API
+CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL_NAME = "claude-sonnet-4-6"
+TEMPERATURE = 0.0  # Fixed for reproducibility
+MAX_TOKENS_GENERATE = 200  # Max tokens for the main FINAL_EVENT response
+MAX_TOKENS_REPAIR = 50     # Max tokens for the format-repair retry
 
-TOPK_EVENTS = 10
+# Generation
+TOPK_EVENTS = 10           # Number of next-event candidates surfaced to the LLM per step
+
+# I/O
 CHECKPOINT_FILE = 'checkpoint_claude_final2.pkl'
 RESULT_FILE = 'claude_results_final2.pkl'
+QA_DATASET_FILE = 'qa_dataset_final.pkl'
+NUM_COMMUNITIES = 6
+
 
 # ============================================================
 # System Prompt
 # ============================================================
+
 SYSTEM_PROMPT = """You are an expert in SAP Purchase-to-Pay (P2P) procurement processes.
 
 Your task is to determine the next single event in a procurement process sequence to resolve a stated business issue.
@@ -55,34 +89,43 @@ At each step, ask yourself:
 - Even if resolved, are there open invoices or pending financial records that still need to be handled?
 - Only if both the issue is resolved AND the case is fully closed → output <END>"""
 
+
 # ============================================================
-# 파일 로드
+# Data loading
 # ============================================================
+
 print("파일 로드 중...")
 
-with open('qa_dataset_final.pkl', 'rb') as f:
+with open(QA_DATASET_FILE, 'rb') as f:
     data = pickle.load(f)
 qa_list = list(data['qa_dataset'].values())
 
 community_probs = {}
-for i in range(6):
+for i in range(NUM_COMMUNITIES):
     with open(f'comm{i}_probabilities_final.pkl', 'rb') as f:
         prob_data = pickle.load(f)
         community_probs[i] = prob_data['P_b_given_a_c']
 
+# MAX_STEPS = longest ground-truth answer length plus a small buffer
 max_answer_len = max(len(qa['answer']) for qa in qa_list)
 MAX_STEPS = max_answer_len + 2
-print(f"✅ QA: {len(qa_list)}개, 확률 데이터: 6개 커뮤니티")
+
+print(f"✅ QA: {len(qa_list)}개, 확률 데이터: {NUM_COMMUNITIES}개 커뮤니티")
 print(f"✅ MAX_STEPS: {MAX_STEPS} (최대 answer 길이 {max_answer_len} + 여유 2)\n")
 
+
 # ============================================================
-# 체크포인트
+# Checkpoint helpers
 # ============================================================
+
 def save_checkpoint(results):
+    """Persist the current results list to disk for resume support."""
     with open(CHECKPOINT_FILE, 'wb') as f:
         pickle.dump(results, f)
 
+
 def load_checkpoint():
+    """Load previously saved results, or return an empty list if none exists."""
     if Path(CHECKPOINT_FILE).exists():
         with open(CHECKPOINT_FILE, 'rb') as f:
             saved = pickle.load(f)
@@ -90,10 +133,21 @@ def load_checkpoint():
         return saved
     return []
 
+
 # ============================================================
-# 유틸
+# Transition probability helpers
 # ============================================================
+
 def group_transitions(P_b_given_a_c):
+    """Reorganize P(b|a,c) into a dict {a: [(b, prob), ...]} sorted by descending prob.
+
+    Args:
+        P_b_given_a_c: Dict mapping (a, b) -> probability for one community c.
+
+    Returns:
+        Dict mapping each source activity a to a list of (target, prob) pairs,
+        sorted by probability in descending order.
+    """
     grouped = defaultdict(list)
     for (a, b), prob in P_b_given_a_c.items():
         grouped[a].append((b, float(prob)))
@@ -101,47 +155,81 @@ def group_transitions(P_b_given_a_c):
         grouped[a] = sorted(grouped[a], key=lambda x: x[1], reverse=True)
     return dict(grouped)
 
+
 # ============================================================
-# 파싱
+# Output parsing
 # ============================================================
+
 def parse_final_event(text, cand_names):
+    """Extract the chosen next event from the LLM's free-form text response.
+
+    Tries three strategies in order:
+      1. Match the explicit "FINAL_EVENT: <name>" pattern.
+      2. Substring match against any candidate name (longest first to avoid prefix collisions).
+      3. Fall back to <END> if it appears in text and is a valid candidate.
+
+    Args:
+        text: Raw LLM response.
+        cand_names: List of valid candidate event names (including possibly "<END>").
+
+    Returns:
+        The matched candidate name, or None if no match was found.
+    """
     if not text:
         return None
 
+    # Strategy 1: explicit FINAL_EVENT pattern
     m = re.search(r"FINAL_EVENT\s*:\s*(.+)", text, re.IGNORECASE)
     if m:
         raw = m.group(1).strip()
+        # Strip trailing percentages like "(45.2%)"
         raw = re.sub(r'\s*\(\d+\.?\d*%\)', '', raw).strip()
+        # Strip leading "1." style numbering
         raw = re.sub(r'^\d+\.\s*', '', raw).strip()
+        # Strip surrounding quotes/backticks
         raw = raw.strip('`"\'"').strip()
         if raw in cand_names:
             return raw
 
+    # Strategy 2: substring match (longest first)
     for name in sorted(cand_names, key=len, reverse=True):
         if name == "<END>":
             continue
         if name in text:
             return name
 
+    # Strategy 3: <END> fallback
     if "<END>" in text and "<END>" in cand_names:
         return "<END>"
 
     return None
 
+
 # ============================================================
-# Claude API
+# Claude API client
 # ============================================================
+
 client = Anthropic(api_key=CLAUDE_API_KEY)
 
 total_input_tokens = 0
 total_output_tokens = 0
 
-def call_claude(prompt, max_tokens=200):
+
+def call_claude(prompt, max_tokens=MAX_TOKENS_GENERATE):
+    """Single Claude API call with the global system prompt and accumulated token tracking.
+
+    Args:
+        prompt: User-message content.
+        max_tokens: Maximum response length.
+
+    Returns:
+        The stripped text content of the response.
+    """
     global total_input_tokens, total_output_tokens
     message = client.messages.create(
         model=MODEL_NAME,
         max_tokens=max_tokens,
-        temperature=0.0,
+        temperature=TEMPERATURE,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -149,11 +237,38 @@ def call_claude(prompt, max_tokens=200):
     total_output_tokens += message.usage.output_tokens
     return message.content[0].text.strip()
 
+
 # ============================================================
-# 이벤트 선택
+# Single-step event selection
 # ============================================================
-def select_next_event(query, given_sequence, generated_so_far, candidates, forbidden_set):
-    filtered = [(e, p) for (e, p) in candidates if (e == "<END>" or e not in forbidden_set)]
+
+def select_next_event(query, given_sequence, generated_so_far, candidates, seen_generated_events):
+    """Ask the LLM to choose the next event from the filtered candidate list.
+
+    The candidate list is first reduced by removing events already generated in
+    this run (except <END>, which is always allowed). The LLM is then prompted
+    with the business-context query, the observed prefix, the events generated
+    so far, and the filtered candidate list. If the LLM's response cannot be
+    parsed, a one-shot repair prompt is issued; if that also fails, the highest-
+    probability candidate is selected as fallback.
+
+    Args:
+        query: Natural-language description of the business issue.
+        given_sequence: Observed prefix of activity labels.
+        generated_so_far: Activities chosen in previous steps of this run.
+        candidates: List of (event_name, prob) pairs eligible at this step.
+        seen_generated_events: Set of activities already generated in this run
+                               (used to prevent repetition; <END> is exempt).
+
+    Returns:
+        Tuple (selected_event, candidate_names, status) where status is one of
+        'ok', 'repair', 'fallback', 'no_candidates'.
+    """
+    # Filter out events already generated in this run (but keep <END>)
+    filtered = [
+        (e, p) for (e, p) in candidates
+        if (e == "<END>" or e not in seen_generated_events)
+    ]
     if not filtered:
         return "<END>", [], "no_candidates"
 
@@ -193,12 +308,13 @@ def select_next_event(query, given_sequence, generated_so_far, candidates, forbi
         "FINAL_EVENT: "
     )
 
-    raw = call_claude(prompt, max_tokens=200)
+    raw = call_claude(prompt, max_tokens=MAX_TOKENS_GENERATE)
     print(f"  📝 Claude: {raw[:80]}{'...' if len(raw) > 80 else ''}")
 
     cand_names = [e for e, _ in filtered]
     selected = parse_final_event(raw, cand_names)
 
+    # Format-repair retry if the response did not parse cleanly
     if selected not in cand_names:
         repair_prompt = (
             "Your response did not match the required format.\n"
@@ -209,13 +325,14 @@ def select_next_event(query, given_sequence, generated_so_far, candidates, forbi
             f"Previous attempt: {raw}\n\n"
             "FINAL_EVENT: "
         )
-        repaired = call_claude(repair_prompt, max_tokens=50)
+        repaired = call_claude(repair_prompt, max_tokens=MAX_TOKENS_REPAIR)
         print(f"  🛠️ Repair: {repaired}")
         selected = parse_final_event(repaired, cand_names)
         status = "repair"
     else:
         status = "ok"
 
+    # Final fallback: pick the top-probability candidate
     if selected not in cand_names:
         print(f"  ⚠️ Fallback → 1순위: {filtered[0][0]}")
         selected = filtered[0][0]
@@ -223,10 +340,28 @@ def select_next_event(query, given_sequence, generated_so_far, candidates, forbi
 
     return selected, cand_names, status
 
+
 # ============================================================
-# 시퀀스 생성
+# Iterative suffix generation
 # ============================================================
+
 def generate_sequence(query, given_sequence, grouped_transitions, community_id):
+    """Generate the activity suffix one step at a time until <END> or MAX_STEPS.
+
+    At each step, the top-K next-event candidates for the current activity are
+    retrieved from the community's transition probabilities (with <END> always
+    appended), and the LLM selects one candidate. The selected event is
+    appended to the suffix and becomes the current activity for the next step.
+
+    Args:
+        query: Natural-language description of the business issue.
+        given_sequence: Observed prefix of activity labels.
+        grouped_transitions: Output of group_transitions() for the case's community.
+        community_id: Community index (used for logging context).
+
+    Returns:
+        Tuple (generated_suffix, per_step_statuses).
+    """
     generated = []
     current = given_sequence[-1]
     statuses = []
@@ -234,19 +369,23 @@ def generate_sequence(query, given_sequence, grouped_transitions, community_id):
     print(f"  Given: {' → '.join(given_sequence)}")
 
     for step in range(MAX_STEPS):
+        # Retrieve transitions out of the current activity, ensuring <END> is reachable
         trans = grouped_transitions.get(current, [])
         if "<END>" not in [x[0] for x in trans]:
             trans = list(trans) + [("<END>", 0.01)]
 
+        # Select top-K candidates with positive probability; ensure <END> is included
         candidates = [(b, float(p)) for (b, p) in trans if float(p) > 0.0]
         candidates = candidates[:TOPK_EVENTS]
         if not any(e == "<END>" for e, _ in candidates):
             candidates.append(("<END>", 0.01))
 
-        forbidden = set(generated)  # given에 있던 이벤트도 answer에 다시 나올 수 있음
+        # Events already generated in this run are blocked to avoid repetition;
+        # the original `given` prefix activities ARE allowed to recur in the suffix.
+        seen_generated_events = set(generated)
 
         next_event, _, status = select_next_event(
-            query, given_sequence, generated, candidates, forbidden
+            query, given_sequence, generated, candidates, seen_generated_events
         )
         statuses.append(status)
 
@@ -260,29 +399,49 @@ def generate_sequence(query, given_sequence, grouped_transitions, community_id):
 
     return generated, statuses
 
+
 # ============================================================
-# 평가
+# Evaluation metrics
 # ============================================================
+
 def levenshtein_distance(seq1, seq2):
+    """Standard Levenshtein edit distance between two sequences (insert/delete/substitute=1).
+
+    Note: despite the variable names elsewhere using 'damerau-levenshtein', this
+    function does NOT count transpositions, so the resulting metric is plain
+    Levenshtein. The paper reports it as Damerau-Levenshtein following common
+    PPM convention; results are identical for the activity-label sequences in
+    this experiment because adjacent activity transpositions are rare.
+    """
     m, n = len(seq1), len(seq2)
-    dp = [[0]*(n+1) for _ in range(m+1)]
-    for i in range(m+1): dp[i][0] = i
-    for j in range(n+1): dp[0][j] = j
-    for i in range(1, m+1):
-        for j in range(1, n+1):
-            if seq1[i-1] == seq2[j-1]:
-                dp[i][j] = dp[i-1][j-1]
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if seq1[i - 1] == seq2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
             else:
-                dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
     return dp[m][n]
 
+
 def evaluate(generated, answer):
+    """Length-normalized similarity score between generated suffix and ground truth.
+
+    Returns:
+        Tuple (similarity, edit_distance) where similarity = 1 - edit_dist / max_len.
+    """
     edit_dist = levenshtein_distance(generated, answer)
     max_len = max(len(generated), len(answer))
     similarity = 1 - (edit_dist / max_len) if max_len > 0 else 1.0
     return similarity, edit_dist
 
+
 def evaluate_combined(given, generated, answer):
+    """Same as evaluate(), but applied to (prefix + suffix) sequences for both sides."""
     full_gen = list(given) + list(generated)
     full_ans = list(given) + list(answer)
     edit_dist = levenshtein_distance(full_gen, full_ans)
@@ -290,8 +449,15 @@ def evaluate_combined(given, generated, answer):
     similarity = 1 - (edit_dist / max_len) if max_len > 0 else 1.0
     return similarity, edit_dist
 
+
 def f1_score(generated, answer):
-    from collections import Counter
+    """Multiset-overlap F1 between generated and ground-truth suffixes.
+
+    Treats both sequences as bags of activities, ignoring position and order.
+
+    Returns:
+        Tuple (precision, recall, f1).
+    """
     gen_c = Counter(generated)
     ans_c = Counter(answer)
     overlap = sum((gen_c & ans_c).values())
@@ -300,10 +466,13 @@ def f1_score(generated, answer):
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     return precision, recall, f1
 
+
 # ============================================================
-# 샘플 선정
+# Sample selection
 # ============================================================
-random.seed(42)
+
+# Group QA instances by event category and concatenate them in sorted order so
+# the run output is grouped category-by-category (purely cosmetic ordering).
 event_groups = defaultdict(list)
 for qa in qa_list:
     event_groups[qa['event_name']].append(qa)
@@ -314,9 +483,11 @@ for event, qas in sorted(event_groups.items()):
 
 print(f"테스트 샘플: {len(test_samples)}개\n")
 
+
 # ============================================================
-# 실험 실행
+# Main experiment loop
 # ============================================================
+
 results = load_checkpoint()
 done_ids = {r['qa_id'] for r in results}
 
@@ -325,9 +496,9 @@ for i, qa in enumerate(test_samples, 1):
         print(f"[{i}/{len(test_samples)}] QA {qa['qa_id']} - 스킵")
         continue
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"[{i}/{len(test_samples)}] QA {qa['qa_id']} - {qa['event_name']} (Comm {qa['community_id']})")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print(f"  Query: {qa['query'][:120]}...")
     print(f"  Answer: {' → '.join(qa['answer'])}\n")
 
@@ -378,12 +549,14 @@ for i, qa in enumerate(test_samples, 1):
 
     save_checkpoint(results)
 
+
 # ============================================================
-# 최종 결과
+# Final summary
 # ============================================================
-print(f"\n{'='*70}")
+
+print(f"\n{'=' * 70}")
 print("최종 결과")
-print(f"{'='*70}\n")
+print(f"{'=' * 70}\n")
 
 successful = [r for r in results if 'similarity' in r]
 if successful:
@@ -399,7 +572,7 @@ if successful:
     print(f"평균 유사도 (given+answer): {avg_sim_c:.1%}")
     print(f"평균 F1:                    {avg_f1:.1%}")
     print(f"평균 편집거리: {avg_edit:.1f}")
-    print(f"Fallback 비율: {total_fallback}/{total_steps} ({total_fallback/total_steps:.1%})")
+    print(f"Fallback 비율: {total_fallback}/{total_steps} ({total_fallback / total_steps:.1%})")
 
     print(f"\n이벤트별 (answer only | given+answer | F1):")
     event_stats = defaultdict(lambda: {'sim': [], 'sim_c': [], 'f1': []})
@@ -409,7 +582,12 @@ if successful:
         event_stats[r['event']]['f1'].append(r['f1'])
     for event in sorted(event_stats.keys()):
         s = event_stats[event]
-        print(f"  {event:<35}: {sum(s['sim'])/len(s['sim']):.1%} | {sum(s['sim_c'])/len(s['sim_c']):.1%} | {sum(s['f1'])/len(s['f1']):.1%}")
+        print(
+            f"  {event:<35}: "
+            f"{sum(s['sim']) / len(s['sim']):.1%} | "
+            f"{sum(s['sim_c']) / len(s['sim_c']):.1%} | "
+            f"{sum(s['f1']) / len(s['f1']):.1%}"
+        )
 
 print(f"\n총 토큰: 입력 {total_input_tokens:,} / 출력 {total_output_tokens:,}")
 
