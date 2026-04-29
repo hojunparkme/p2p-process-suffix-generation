@@ -1,20 +1,59 @@
 """
-SuTraN QA 평가 스크립트
-- best model (epoch 68) 로드
-- QA 180개 더미 타임스탬프로 평가
+SuTraN baseline evaluation on the 180 QA instances from BPI Challenge 2019.
+
+This script wraps the SuTraN suffix-prediction model from:
+    Wuyts, B., vanden Broucke, S., & De Weerdt, J. (2024).
+    SuTraN: an Encoder-Decoder Transformer for full-context-aware suffix
+    prediction of business processes. ICPM 2024.
+
+It loads the best validation-loss checkpoint produced by the official SuTraN
+training pipeline, builds the input tensors required by SuTraN's inference
+loop from each QA prefix, runs prediction, and computes Damerau-Levenshtein
+similarity and F1 score against the ground-truth suffix.
+
+Why dummy timestamps:
+  The 180 QA instances were extracted from BPIC 2019 as activity-only
+  prefix/answer pairs; the original event timestamps are not preserved in
+  the QA dataset. SuTraN, however, expects time features at inference time.
+  We synthesize a fixed 1-hour spacing from a base date for the prefix,
+  apply the training-set normalization stats, and rely on the model's
+  activity-only logits for the suffix prediction. This affects only the
+  numeric features; the activity prediction itself is the metric of interest.
+
+Inputs:
+  - SuTraN training artifacts: cardinality dicts, normalization stats,
+    train_tensordataset.pt, and the best-epoch checkpoint
+    (model_epoch_68.pt, identified by the SuTraN training run).
+  - qa_dataset_final.pkl : the 180 QA instances.
+
+Outputs:
+  - sutran_qa_results.pkl : per-QA predictions, DL/F1 scores, and summary.
+
+Required external dependency:
+  https://github.com/BrechtWts/SuffixTransformerNetwork  (SuTraN repo)
+  is expected to be cloned at SUTRAN_DIR below; this script imports the
+  SuTraN model class and inference loop from it.
 """
 
-import os, sys, pickle
-import numpy as np
+import os
+import pickle
+import sys
 from collections import Counter
 from datetime import datetime, timedelta
+
+import numpy as np
 import torch
+
+
+# ============================================================
+# Configuration
+# ============================================================
 
 SUTRAN_DIR  = "/workspace/hojun/SuffixTransformerNetwork"
 sys.path.insert(0, SUTRAN_DIR)
 
-from SuTraN.SuTraN import SuTraN
-from SuTraN.inference_procedure import inference_loop
+from SuTraN.SuTraN import SuTraN  # noqa: E402  (import after sys.path edit)
+from SuTraN.inference_procedure import inference_loop  # noqa: E402
 
 LOG_NAME   = "BPIC_19"
 LOG_DIR    = os.path.join(SUTRAN_DIR, LOG_NAME)
@@ -25,36 +64,47 @@ OUT_PATH   = os.path.join(LOG_DIR, "sutran_qa_results.pkl")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"디바이스: {device}")
 
+
+# ============================================================
+# Load SuTraN training artifacts
+# ============================================================
+
 def load_dict(path):
+    """Load a single pickled dict from disk."""
     with open(path, 'rb') as f:
         return pickle.load(f)
 
 cardin_dict         = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_cardin_dict.pkl'))
 cardin_list_prefix  = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_cardin_list_prefix.pkl'))
-cardin_list_suffix  = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_cardin_list_suffix.pkl'))
 num_cols_dict       = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_num_cols_dict.pkl'))
 cat_cols_dict       = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_cat_cols_dict.pkl'))
 categ_mapping       = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_categ_mapping.pkl'))
 train_means_dict    = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_train_means_dict.pkl'))
 train_std_dict      = load_dict(os.path.join(LOG_DIR, f'{LOG_NAME}_train_std_dict.pkl'))
 
+# +2 in num_activities reserves slots for padding (0) and EOS (last index)
 num_activities      = cardin_dict['concept:name'] + 2
 num_numericals_pref = len(num_cols_dict['prefix_df'])
 num_numericals_suf  = len(num_cols_dict['suffix_df'])
 num_cat_pref        = len(cat_cols_dict['prefix_df'])
 num_cols_pref       = num_cols_dict['prefix_df']
-tss_index           = num_cols_pref.index('ts_start')
 
+# Recover window_size from the saved training tensors
 train_data  = torch.load(os.path.join(LOG_DIR, 'train_tensordataset.pt'), map_location='cpu')
 window_size = train_data[0].shape[1]
 print(f"num_activities={num_activities}  window_size={window_size}  num_cat_pref={num_cat_pref}")
 
+# Time-feature normalization stats (mean, std) per target
 mean_std_ttne = [train_means_dict['timeLabel_df'][0], train_std_dict['timeLabel_df'][0]]
 mean_std_tsp  = [train_means_dict['suffix_df'][0],    train_std_dict['suffix_df'][0]]
 mean_std_tss  = [train_means_dict['suffix_df'][1],    train_std_dict['suffix_df'][1]]
 mean_std_rrt  = [train_means_dict['timeLabel_df'][1], train_std_dict['timeLabel_df'][1]]
 
-# 모델 로드
+
+# ============================================================
+# Load model
+# ============================================================
+
 model = SuTraN(
     num_activities                = num_activities,
     d_model                       = 32,
@@ -75,27 +125,59 @@ model.to(device)
 model.eval()
 print("모델 로드 완료")
 
+
+# ============================================================
+# Activity index mapping
+# ============================================================
+
 act_label  = 'concept:name'
 act_map    = categ_mapping[act_label]
+# Indices in act_map are 0-based; SuTraN reserves 0 for padding, so we shift by +1
 idx_to_act = {v + 1: k for k, v in act_map.items()}
 eos_idx    = num_activities - 1
+
+
+# ============================================================
+# Load QA dataset
+# ============================================================
 
 with open(QA_PATH, 'rb') as f:
     qa_raw = pickle.load(f)
 qa_dataset = qa_raw.get('qa_dataset', qa_raw) if isinstance(qa_raw, dict) else qa_raw
 print(f"QA: {len(qa_dataset)}개")
 
+# Synthetic base date: prefix events are spaced 1 hour apart starting from
+# 2018-06-01 09:00 (chosen to fall within BPIC 2019's nominal range)
 base = datetime(2018, 6, 1, 9, 0, 0, tzinfo=datetime.now().astimezone().tzinfo)
 
 means_arr = np.array(train_means_dict['prefix_df'])
 stds_arr  = np.array(train_std_dict['prefix_df'])
 
+
+# ============================================================
+# Tensor builders
+# ============================================================
+
 def build_tensors(given, answer):
+    """Build the SuTraN-compatible input tensors for one QA instance.
+
+    The prefix is left-padded to `window_size`. Categorical features are
+    one-hot via the categ_mapping (with padding token = 0). Numeric features
+    use synthetic 1-hour-spaced timestamps and are normalized with the
+    training-set mean/std. Suffix labels (act_label_t) are populated for
+    bookkeeping; SuTraN's inference loop only needs them for shape
+    consistency since we use teacher-free decoding.
+
+    Returns:
+        Tuple of tensors used by SuTraN.inference_loop (categorical list,
+        numerics, padding mask, suffix placeholders, time labels, RRT label,
+        activity label).
+    """
     n = len(given)
     leftpad = window_size - n
     prefix_ts = [base + timedelta(hours=i) for i in range(n)]
 
-    # cat tensors
+    # Categorical tensors (one slot per prefix categorical column)
     cat_tensors = []
     for col in cat_cols_dict['prefix_df']:
         t = torch.zeros(1, window_size, dtype=torch.long)
@@ -104,8 +186,9 @@ def build_tensors(given, answer):
                 t[0, i + leftpad] = act_map.get(act, max(act_map.values())) + 1
         cat_tensors.append(t)
 
-    # numeric tensor
-    case_start = prefix_ts[0]; last_t = prefix_ts[0]
+    # Numeric tensor with normalized time deltas
+    case_start = prefix_ts[0]
+    last_t = prefix_ts[0]
     num_t = torch.zeros(1, window_size, num_numericals_pref, dtype=torch.float32)
     for i, ts in enumerate(prefix_ts):
         dp = 0.0 if i == 0 else (ts - last_t).total_seconds()
@@ -116,11 +199,11 @@ def build_tensors(given, answer):
             std = stds_arr[j] if stds_arr[j] != 0 else 1.0
             num_t[0, i + leftpad, j] = (val - means_arr[j]) / std
 
-    # pad mask
+    # Padding mask: True where padded, False where real prefix tokens are
     pad_mask = torch.ones(1, window_size, dtype=torch.bool)
     pad_mask[0, leftpad:] = False
 
-    # suffix labels
+    # Suffix labels (used for shape parity; not consumed during free decoding)
     act_label_t = torch.zeros(1, window_size, dtype=torch.long)
     for i, act in enumerate(answer[:window_size-1]):
         act_label_t[0, i] = act_map.get(act, max(act_map.values())) + 1
@@ -134,7 +217,11 @@ def build_tensors(given, answer):
 
     return cat_tensors, num_t, pad_mask, suf_act, suf_num, ttne_label, rrt_label, act_label_t
 
-# 배치 구성
+
+# ============================================================
+# Build batch
+# ============================================================
+
 print("텐서 구성 중...")
 qa_ids  = list(qa_dataset.keys())
 all_cat = [[] for _ in range(num_cat_pref)]
@@ -148,9 +235,13 @@ for qa_id in qa_ids:
     cats, num_t, pad, suf_act, suf_num, ttne, rrt, act_lbl = build_tensors(given, answer)
     for i, ct in enumerate(cats):
         all_cat[i].append(ct)
-    all_num.append(num_t); all_pad.append(pad)
-    all_suf_act.append(suf_act); all_suf_num.append(suf_num)
-    all_ttne.append(ttne); all_rrt.append(rrt); all_act_lbl.append(act_lbl)
+    all_num.append(num_t)
+    all_pad.append(pad)
+    all_suf_act.append(suf_act)
+    all_suf_num.append(suf_num)
+    all_ttne.append(ttne)
+    all_rrt.append(rrt)
+    all_act_lbl.append(act_lbl)
 
 batch_cat     = [torch.cat(all_cat[i], dim=0) for i in range(num_cat_pref)]
 batch_num     = torch.cat(all_num, dim=0)
@@ -161,12 +252,18 @@ batch_ttne    = torch.cat(all_ttne, dim=0)
 batch_rrt     = torch.cat(all_rrt, dim=0)
 batch_act_lbl = torch.cat(all_act_lbl, dim=0)
 
-inference_dataset = tuple(batch_cat) + (batch_num, batch_pad,
-                                         batch_suf_act, batch_suf_num,
-                                         batch_ttne, batch_rrt, batch_act_lbl)
+inference_dataset = tuple(batch_cat) + (
+    batch_num, batch_pad,
+    batch_suf_act, batch_suf_num,
+    batch_ttne, batch_rrt, batch_act_lbl,
+)
 print(f"배치: {len(qa_ids)}개  텐서 수: {len(inference_dataset)}")
 
-# inference
+
+# ============================================================
+# Inference
+# ============================================================
+
 print("\nSuTraN inference 시작...")
 results_list = inference_loop(
     model                  = model,
@@ -182,35 +279,58 @@ results_list = inference_loop(
 )
 print(f"inference_loop DL: {results_list[2]:.4f}")
 
-# 예측 suffix 추출 (F1용)
+
+# ============================================================
+# Extract predicted suffixes for F1 evaluation
+# ============================================================
+
+# Re-run a forward pass to get the suffix activity predictions (the
+# inference_loop above returns only the aggregate DL score).
 print("예측 suffix 추출 중...")
 model.eval()
 with torch.no_grad():
-    inputs = [t.to(device) for t in tuple(batch_cat) + (batch_num, batch_pad,
-                                                          batch_suf_act, batch_suf_num)]
+    inputs = [
+        t.to(device)
+        for t in tuple(batch_cat) + (batch_num, batch_pad, batch_suf_act, batch_suf_num)
+    ]
     outputs = model(inputs, window_size, mean_std_ttne, mean_std_tsp, mean_std_tss)
 suffix_acts = outputs[0].cpu()  # (N, W)
 
+
+# ============================================================
+# Evaluation metrics
+# ============================================================
+
 def dl_similarity(s1, s2):
+    """Length-normalized Damerau-Levenshtein similarity in [0, 1]."""
     if not s1 and not s2: return 1.0
     if not s1 or  not s2: return 0.0
     l1, l2 = len(s1), len(s2)
     d = np.arange(l2+1, dtype=float)
     for i in range(1, l1+1):
-        prev=d.copy(); d[0]=i
+        prev = d.copy(); d[0] = i
         for j in range(1, l2+1):
-            cost = 0 if s1[i-1]==s2[j-1] else 1
+            cost = 0 if s1[i-1] == s2[j-1] else 1
             d[j] = min(d[j-1]+1, prev[j]+1, prev[j-1]+cost)
-            if i>1 and j>1 and s1[i-1]==s2[j-2] and s1[i-2]==s2[j-1]:
+            if i > 1 and j > 1 and s1[i-1] == s2[j-2] and s1[i-2] == s2[j-1]:
                 d[j] = min(d[j], prev[j-1])
-    return max(0.0, 1-d[l2]/max(l1,l2))
+    return max(0.0, 1 - d[l2] / max(l1, l2))
+
 
 def f1_sets(pred, answer):
+    """Multiset-overlap F1 between predicted and ground-truth suffixes."""
     pc, ac = Counter(pred), Counter(answer)
     tp = sum((pc & ac).values())
-    if tp == 0: return 0.0
-    p = tp/sum(pc.values()); r = tp/sum(ac.values())
-    return 2*p*r/(p+r)
+    if tp == 0:
+        return 0.0
+    p = tp / sum(pc.values())
+    r = tp / sum(ac.values())
+    return 2 * p * r / (p + r)
+
+
+# ============================================================
+# Aggregate per-QA results
+# ============================================================
 
 results = {}
 dl_list, f1_list = [], []
@@ -219,20 +339,30 @@ for i, qa_id in enumerate(qa_ids):
     qa     = qa_dataset[qa_id]
     answer = list(qa['answer'])
     given  = list(qa['given'])
+
+    # Decode the SuTraN output sequence: stop on EOS or padding (0)
     predicted = []
     for idx in suffix_acts[i].tolist():
-        if idx == eos_idx or idx == 0: break
+        if idx == eos_idx or idx == 0:
+            break
         act = idx_to_act.get(int(idx), None)
-        if act: predicted.append(act)
+        if act:
+            predicted.append(act)
 
     sim = dl_similarity(predicted, answer)
     f1  = f1_sets(predicted, answer)
-    dl_list.append(sim); f1_list.append(f1)
-    results[qa_id] = {'given': given, 'answer': answer, 'predicted': predicted,
-                      'dl_similarity': sim, 'f1': f1}
+    dl_list.append(sim)
+    f1_list.append(f1)
+    results[qa_id] = {
+        'given': given, 'answer': answer, 'predicted': predicted,
+        'dl_similarity': sim, 'f1': f1,
+    }
 
-summary = {'mean_dl_similarity': float(np.mean(dl_list)),
-           'mean_f1': float(np.mean(f1_list)), 'n': len(dl_list)}
+summary = {
+    'mean_dl_similarity': float(np.mean(dl_list)),
+    'mean_f1': float(np.mean(f1_list)),
+    'n': len(dl_list),
+}
 
 print(f"\n{'='*50}")
 print(f"SuTraN 결과 ({summary['n']}개)")
@@ -240,14 +370,21 @@ print(f"  DL Similarity : {summary['mean_dl_similarity']:.4f}")
 print(f"  F1 Score      : {summary['mean_f1']:.4f}")
 print(f"{'='*50}")
 
+# Per-event-type breakdown
 by_type = {}
 for qa_id, r in results.items():
     key = qa_dataset[qa_id]['event_key']
-    by_type.setdefault(key, {'f1':[], 'dl':[]})
-    by_type[key]['f1'].append(r['f1']); by_type[key]['dl'].append(r['dl_similarity'])
+    by_type.setdefault(key, {'f1': [], 'dl': []})
+    by_type[key]['f1'].append(r['f1'])
+    by_type[key]['dl'].append(r['dl_similarity'])
 print("\n이벤트 타입별:")
 for k, v in sorted(by_type.items()):
     print(f"  {k:<35} N={len(v['f1']):3d}  DL={np.mean(v['dl']):.3f}  F1={np.mean(v['f1']):.3f}")
+
+
+# ============================================================
+# Save
+# ============================================================
 
 with open(OUT_PATH, 'wb') as f:
     pickle.dump({'results': results, 'summary': summary}, f)
