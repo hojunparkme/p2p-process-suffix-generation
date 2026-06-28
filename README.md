@@ -6,7 +6,7 @@
 ---
 
 <p align="center">
-  <img src="assets/framework.svg" alt="Framework Architecture" width="700"/>
+  <img src="assets/framework.png" alt="Framework Architecture" width="640"/>
 </p>
 
 ---
