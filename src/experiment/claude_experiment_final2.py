@@ -1,5 +1,5 @@
 """
-CTP-LLM: Context and Transition Probability-guided LLM for P2P process suffix generation.
+TPGLR: Transition Probability-Guided LLM Reasoning for P2P process suffix generation.
 
 This module runs the main experiment of the paper. For each of the 180 evaluation QA
 instances drawn from the BPI Challenge 2019 Purchase-to-Pay log, it iteratively
@@ -404,14 +404,14 @@ def generate_sequence(query, given_sequence, grouped_transitions, community_id):
 # Evaluation metrics
 # ============================================================
 
-def levenshtein_distance(seq1, seq2):
-    """Standard Levenshtein edit distance between two sequences (insert/delete/substitute=1).
+def damerau_levenshtein_distance(seq1, seq2):
+    """Damerau-Levenshtein edit distance between two sequences.
 
-    Note: despite the variable names elsewhere using 'damerau-levenshtein', this
-    function does NOT count transpositions, so the resulting metric is plain
-    Levenshtein. The paper reports it as Damerau-Levenshtein following common
-    PPM convention; results are identical for the activity-label sequences in
-    this experiment because adjacent activity transpositions are rare.
+    Counts insertions, deletions, substitutions (cost 1 each) AND adjacent
+    transpositions (cost 1). This is the metric reported as "DL similarity"
+    in the paper, and is identical to the dl_similarity() used by the baseline
+    scripts (sutran_qa_eval.py, tax_lstm_torch.py), so all four methods are
+    evaluated under one consistent metric.
     """
     m, n = len(seq1), len(seq2)
     dp = [[0] * (n + 1) for _ in range(m + 1)]
@@ -421,10 +421,16 @@ def levenshtein_distance(seq1, seq2):
         dp[0][j] = j
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            if seq1[i - 1] == seq2[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
-            else:
-                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
+            cost = 0 if seq1[i - 1] == seq2[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,         # deletion
+                dp[i][j - 1] + 1,         # insertion
+                dp[i - 1][j - 1] + cost,  # substitution
+            )
+            if (i > 1 and j > 1
+                    and seq1[i - 1] == seq2[j - 2]
+                    and seq1[i - 2] == seq2[j - 1]):
+                dp[i][j] = min(dp[i][j], dp[i - 2][j - 2] + 1)  # transposition
     return dp[m][n]
 
 
@@ -434,7 +440,7 @@ def evaluate(generated, answer):
     Returns:
         Tuple (similarity, edit_distance) where similarity = 1 - edit_dist / max_len.
     """
-    edit_dist = levenshtein_distance(generated, answer)
+    edit_dist = damerau_levenshtein_distance(generated, answer)
     max_len = max(len(generated), len(answer))
     similarity = 1 - (edit_dist / max_len) if max_len > 0 else 1.0
     return similarity, edit_dist
@@ -444,7 +450,7 @@ def evaluate_combined(given, generated, answer):
     """Same as evaluate(), but applied to (prefix + suffix) sequences for both sides."""
     full_gen = list(given) + list(generated)
     full_ans = list(given) + list(answer)
-    edit_dist = levenshtein_distance(full_gen, full_ans)
+    edit_dist = damerau_levenshtein_distance(full_gen, full_ans)
     max_len = max(len(full_gen), len(full_ans))
     similarity = 1 - (edit_dist / max_len) if max_len > 0 else 1.0
     return similarity, edit_dist
